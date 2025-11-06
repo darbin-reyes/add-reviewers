@@ -5,7 +5,7 @@ from emoji import emojize
 
 fire = emojize(":fire:")
 
-def color(m: str, fg: str | None = None) -> str:
+def color(m: str, fg: str) -> str:
     return click.style(m, fg=fg)
 
 

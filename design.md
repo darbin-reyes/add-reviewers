@@ -27,14 +27,3 @@ gh pr list --state merged --limit 100 --json number,files,reviews | jq --arg fil
 # list users who approved PR 9
 
 gh pr view 9 --json reviews | jq '.reviews[] | select(.state == \"APPROVED\") | .author.login '
-
-
-# Prompt
-
-* Initialize repository for a python CLI which uses click to implement the CLI,
-use src layout, with __main__.py, cli.py. Include pyproject.toml such that the
-CLI can be invoked as "add-reviewers", hatch as the build backend, dynamically
-determined version via _version.py, author name Darbin Reyes, email
-darbin.reyes@intel.com, description "CLI that automatically adds pull request
-reviewers based on past approvals.", dependencies click, yaspin, coloroma,
-emoji.

@@ -9,23 +9,13 @@ pip install .[dependencies]
 ```
 
 ## Usage
-
+l
 ```bash
 add-reviewers --help
-```
-
-## Development
-
-This project uses [Hatch](https://hatch.pypa.io/) as the build backend.
-
-### Install in development mode
-
-```bash
-pip install -e .
 ```
 
 ### Run the CLI
 
 ```bash
-add-reviewers hello
+add-reviewers diff --pr 130141 --remote https://github.com/intel-restricted/firmware.boot.uefi.iafw.intel
 ```

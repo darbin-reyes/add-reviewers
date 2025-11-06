@@ -34,13 +34,17 @@ def diff(remote, pr):
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        click.echo(green("\n" + result.stdout))
+        m = green("\n" + result.stdout)
+        click.echo(m)
     except subprocess.CalledProcessError as e:
-        click.echo(red(f"Error running gh command: {e.stderr}"), err=True)
-        raise click.Abort()
-    except FileNotFoundError:
-        click.echo(red("Error: 'gh' command not found. Please install GitHub CLI."), err=True)
-        raise click.Abort()
+        m = red(f"Error running gh command: {e.stderr}")
+        raise click.ClickException(m) from e
+    except FileNotFoundError as e:
+        m = red("Error: 'gh' command not found. Please install GitHub CLI.")
+        raise click.ClickException(m) from e
+    except Exception as e:
+        m = red(f"Exception: {e}.")
+        raise click.ClickException(m) from e
 
 
 if __name__ == "__main__":

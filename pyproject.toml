@@ -52,3 +52,6 @@ path = "src/add_reviewers/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/add_reviewers"]
+
+[tool.hatch.envs.default.scripts]
+build-exe = "pyinstaller --name add-reviewers --onefile src\\add_reviewers\\__main__.py"
