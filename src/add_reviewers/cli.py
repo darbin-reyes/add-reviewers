@@ -1,12 +1,13 @@
 """CLI implementation for add-reviewers."""
 
-import subprocess
 import click
 from yaspin import yaspin
 from yaspin.spinners import Spinners
-from add_reviewers.x import fire, red, yellow, green
+from add_reviewers.x import (
+    fire, red, yellow, green, gh_installed, jq_installed, run, random_verb,
+    validate_pr_number, parse_repo_url, query_github_graphql
+)
 from add_reviewers._version import __version__
-
 
 
 # accept -h and --help as help options, not just --help.
@@ -18,34 +19,132 @@ def main():
     """CLI that automatically adds pull request reviewers based on past approvals."""
     pass
 
+def _diff(remote: str, pr: int) -> list[str]:
+    """See diff()."""
 
-@main.command()
-@click.option('--remote', type=str, help='URL of repository remote. Inferred from CWD if not specified.')
-@click.option('--pr', type=int, required=True, help='Pull request number.')
-@yaspin(Spinners.dots2, text="Fooing ")
-def diff(remote, pr):
-    """List files modified by a given pull request."""
+    gh_installed()
 
     # Build the gh pr diff command
-    cmd = ["gh", "pr", "diff", str(pr), "--name-only"]
-
-    if remote:
-        cmd.extend(["--repo", remote])
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        m = green("\n" + result.stdout)
-        click.echo(m)
-    except subprocess.CalledProcessError as e:
-        m = red(f"Error running gh command: {e.stderr}")
-        raise click.ClickException(m) from e
-    except FileNotFoundError as e:
-        m = red("Error: 'gh' command not found. Please install GitHub CLI.")
-        raise click.ClickException(m) from e
-    except Exception as e:
-        m = red(f"Exception: {e}.")
-        raise click.ClickException(m) from e
+    cmd: list[str] = ["gh", "pr", "diff", str(pr), "--name-only", "--repo", remote]
 
 
-if __name__ == "__main__":
-    main()
+    stdout: str = run(cmd)
+
+    pr_url = f"{remote}/pull/{pr}"
+    m = green(f"\n\nFILES MODIFIED BY PR: {pr_url}")
+    click.echo(m)
+    click.echo(stdout)
+
+    files: list[str] = stdout.strip().split("\n")
+
+    click.echo(f"{len(files)} files touched.")
+
+    return files
+
+
+
+@main.command()
+@click.option('--remote', type=str, required=True, help='URL of repository remote.')
+@click.option('--pr', type=int, required=True, callback=validate_pr_number, help='Pull request number.')
+def diff(remote: str, pr: int):
+    """List files modified by a given pull request."""
+
+    with yaspin(Spinners.dots2, text=random_verb()) as spinner:
+        _diff(remote, pr)
+        spinner.ok("✓")
+
+def __list(remote: str, count: int) -> list[dict[str, any]]:
+    """See _list()."""
+
+
+    owner, repo = parse_repo_url(remote)
+
+    # GraphQL query to fetch merged PRs with files and reviews
+    # direction: DESC sorts the pull requests in descending order (newest first) based on the UPDATED_AT field.
+    # The 100 in files(first: 100) and reviews(first: 100) limits how many files and reviews are fetched for each pull request.
+    query = """
+    query($owner: String!, $repo: String!, $limit: Int!) {
+        repository(owner: $owner, name: $repo) {
+        pullRequests(first: $limit, states: MERGED, orderBy: {field: UPDATED_AT, direction: DESC}) {
+            nodes {
+            number
+            files(first: 100) {
+                nodes {
+                path
+                }
+            }
+            reviews(first: 100, states: APPROVED) {
+                nodes {
+                author {
+                    login
+                }
+                }
+            }
+            }
+        }
+        }
+    }
+    """
+
+    variables = {
+        'owner': owner,
+        'repo': repo,
+        'limit': count
+    }
+
+    data = query_github_graphql(query, variables)
+
+    # Extract and display PRs
+    pull_requests = data.get('data', {}).get('repository', {}).get('pullRequests', {}).get('nodes', [])
+
+    if not pull_requests:
+        click.echo(yellow("No merged pull requests found."))
+        return []
+
+    click.echo(green(f"\n{len(pull_requests)} most recent merged pull requests in {remote}:\n"))
+
+    ret = []
+    for pr in pull_requests:
+        number = pr['number']
+        files = [f['path'] for f in pr.get('files', {}).get('nodes', [])]
+        reviews = [r['author']['login'] for r in pr.get('reviews', {}).get('nodes', []) if r.get('author')]
+
+        click.echo(f"PR #{number}")
+        click.echo(f"  Files ({len(files)}): {', '.join(files) if files else 'None'}")
+        click.echo(f"  Approved by ({len(reviews)}): {', '.join(reviews) if reviews else 'None'}")
+        click.echo()
+        ret.append({"number": number, "files" : files, "approvers": reviews})
+
+    return ret
+
+@main.command("list-merged")
+@click.option('--remote', type=str, required=True, help='URL of repository remote.')
+@click.option('--count', type=int, default=100, help='Number of pull requests to list.')
+def _list(remote: str, count: int):
+    """List the most recent merged pull requests in repository specified by remote."""
+
+    with yaspin(Spinners.dots2, text=random_verb()) as spinner:
+        __list(remote, count)
+        spinner.ok("✓")
+
+@main.command()
+@click.option('--remote', type=str, required=True, help='URL of repository remote.')
+@click.option('--pr', type=int, required=True, callback=validate_pr_number, help='Open pull request number.')
+def test(remote: str, pr: int):
+
+    with yaspin(Spinners.dots2, text=random_verb()) as spinner:
+        open_pr_files: list[str] = _diff(remote, pr)
+        spinner.ok("✓")
+
+    with yaspin(Spinners.dots2, text=random_verb()) as spinner:
+        merged_prs = __list(remote, 100)
+        spinner.ok("✓")
+
+    auto_reviewers = set()
+    for mpr in merged_prs:
+        # Add approvers if merged PR touched any file that the open PR touches
+        if any(f in mpr["files"] for f in open_pr_files):
+            auto_reviewers.update(mpr["approvers"])
+
+    click.echo(f"{len(auto_reviewers)} approvers found. They will be added as reviewers to PR # {pr}.")
+    click.echo(green(f"{auto_reviewers}"))
