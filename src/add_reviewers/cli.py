@@ -55,17 +55,22 @@ def diff(remote: str, pr: int):
 
 def __list(remote: str, count: int) -> list[dict[str, any]]:
     """See _list()."""
-
+    if count <= 0:
+        raise click.ClickException(red(f"{count} is invalid. Count must be positive."))
 
     owner, repo = parse_repo_url(remote)
 
-    # GraphQL query to fetch merged PRs with files and reviews
+    # GraphQL query to fetch merged PRs with files and reviews using pagination
     # direction: DESC sorts the pull requests in descending order (newest first) based on the UPDATED_AT field.
     # The 100 in files(first: 100) and reviews(first: 100) limits how many files and reviews are fetched for each pull request.
     query = """
-    query($owner: String!, $repo: String!, $limit: Int!) {
+    query($owner: String!, $repo: String!, $limit: Int!, $after: String) {
         repository(owner: $owner, name: $repo) {
-        pullRequests(first: $limit, states: MERGED, orderBy: {field: UPDATED_AT, direction: DESC}) {
+        pullRequests(first: $limit, states: MERGED, orderBy: {field: UPDATED_AT, direction: DESC}, after: $after) {
+            pageInfo {
+            hasNextPage
+            endCursor
+            }
             nodes {
             number
             files(first: 100) {
@@ -86,16 +91,41 @@ def __list(remote: str, count: int) -> list[dict[str, any]]:
     }
     """
 
-    variables = {
-        'owner': owner,
-        'repo': repo,
-        'limit': count
-    }
+    # Fetch up to 200 PRs using pagination (100 per query)
+    all_pull_requests = []
+    cursor = None
+    target_count = (count // 100 + 1) * 100 # min(count, 200)  # Cap at 200 for this implementation
+    np = target_count // 100
 
-    data = query_github_graphql(query, variables)
+    for page in range(np):  # Maximum 2 pages to get 200 PRs
+        remaining = target_count - len(all_pull_requests)
+        if remaining <= 0:
+            break
+
+        page_size = min(100, remaining)
+
+        variables = {
+            'owner': owner,
+            'repo': repo,
+            'limit': page_size,
+            'after': cursor
+        }
+
+        data = query_github_graphql(query, variables)
+
+        pr_data = data.get('data', {}).get('repository', {}).get('pullRequests', {})
+        page_prs = pr_data.get('nodes', [])
+        page_info = pr_data.get('pageInfo', {})
+
+        all_pull_requests.extend(page_prs)
+
+        # Check if there are more pages and update cursor
+        if not page_info.get('hasNextPage', False):
+            break
+        cursor = page_info.get('endCursor')
 
     # Extract and display PRs
-    pull_requests = data.get('data', {}).get('repository', {}).get('pullRequests', {}).get('nodes', [])
+    pull_requests = all_pull_requests
 
     if not pull_requests:
         click.echo(yellow("No merged pull requests found."))
@@ -137,7 +167,7 @@ def test(remote: str, pr: int):
         spinner.ok("✓")
 
     with yaspin(Spinners.dots2, text=random_verb()) as spinner:
-        merged_prs = __list(remote, 100)
+        merged_prs = __list(remote, 1000)
         spinner.ok("✓")
 
     auto_reviewers = set()
