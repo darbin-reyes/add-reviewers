@@ -1,6 +1,8 @@
 """CLI implementation for add-reviewers."""
 
 import click
+import os
+from pathlib import Path
 from yaspin import yaspin
 from yaspin.spinners import Spinners
 from add_reviewers.x import (
@@ -10,6 +12,25 @@ from add_reviewers.x import (
 from add_reviewers._version import __version__
 
 
+def validate_directory(ctx, param, value):
+    """Validate that the directory exists and is a git repository."""
+    if value is None:
+        return value
+
+    dir_path = Path(value)
+
+    if not dir_path.exists():
+        raise click.BadParameter(f"Directory '{value}' does not exist.")
+
+    if not dir_path.is_dir():
+        raise click.BadParameter(f"'{value}' is not a directory.")
+
+    git_dir = dir_path / '.git'
+    if not git_dir.exists():
+        raise click.BadParameter(f"Directory '{value}' is not a git repository (no .git directory found).")
+
+    return value
+
 # accept -h and --help as help options, not just --help.
 CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"])
 
@@ -18,6 +39,40 @@ CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"])
 def main():
     """CLI that automatically adds pull request reviewers based on past approvals."""
     pass
+
+def _email_to_github_username(email: str) -> str | None:
+    """Try to map an email address to a GitHub username using the GitHub API."""
+    try:
+        # Use GitHub API to search for users by email
+        # Note: This requires appropriate API scopes and may not work for all emails
+        import subprocess
+        import json
+
+        # Try to search for the user by email using gh api
+        cmd = ["gh", "api", "/search/users", "-f", f"q={email}"]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        data = json.loads(result.stdout)
+
+        if data.get('total_count', 0) > 0:
+            return data['items'][0]['login']
+
+        return None
+    except Exception:
+        return None
+
+def _diff_local(dir: Path, base: str, head: str):
+    """git diff locally vs. gh command/api."""
+    cmd = ["git", "-C", dir, "diff", "--name-only", f"{base}..{head}"]
+
+    stdout: str = run(cmd)
+
+    click.echo(stdout)
+
+    files: list[str] = stdout.strip().split("\n")
+
+    click.echo(f"{len(files)} files touched.")
+
+    return files
 
 def _diff(remote: str, pr: int) -> list[str]:
     """See diff()."""
@@ -53,7 +108,7 @@ def diff(remote: str, pr: int):
         _diff(remote, pr)
         spinner.ok("✓")
 
-def __list(remote: str, count: int) -> list[dict[str, any]]:
+def __list(remote: str, count: int) -> list[dict[str, str]]:
     """See _list()."""
     if count <= 0:
         raise click.ClickException(red(f"{count} is invalid. Count must be positive."))
@@ -91,13 +146,13 @@ def __list(remote: str, count: int) -> list[dict[str, any]]:
     }
     """
 
-    # Fetch up to 200 PRs using pagination (100 per query)
+    # Fetch up to 100 PRs using pagination
     all_pull_requests = []
     cursor = None
-    target_count = (count // 100 + 1) * 100 # min(count, 200)  # Cap at 200 for this implementation
+    target_count = (count // 100 + 1) * 100
     np = target_count // 100
 
-    for page in range(np):  # Maximum 2 pages to get 200 PRs
+    for page in range(np):
         remaining = target_count - len(all_pull_requests)
         if remaining <= 0:
             break
@@ -160,14 +215,18 @@ def _list(remote: str, count: int):
 @main.command()
 @click.option('--remote', type=str, required=True, help='URL of repository remote.')
 @click.option('--pr', type=int, required=True, callback=validate_pr_number, help='Open pull request number.')
-def test(remote: str, pr: int):
-
+@click.option('--count', type=int, required=True, help='Number of pull requests to list.')
+def mrm_approvers(remote: str, pr: int, count: int):
+    """
+    Lists past approvers of changes to files touched by 'pr' in the 'count' most
+    recent merged prs.
+    """
     with yaspin(Spinners.dots2, text=random_verb()) as spinner:
         open_pr_files: list[str] = _diff(remote, pr)
         spinner.ok("✓")
 
     with yaspin(Spinners.dots2, text=random_verb()) as spinner:
-        merged_prs = __list(remote, 1000)
+        merged_prs = __list(remote, count)
         spinner.ok("✓")
 
     auto_reviewers = set()
@@ -178,3 +237,56 @@ def test(remote: str, pr: int):
 
     click.echo(f"{len(auto_reviewers)} approvers found. They will be added as reviewers to PR # {pr}.")
     click.echo(green(f"{auto_reviewers}"))
+
+
+# @click.option('--remote', type=str, required=False, help='URL of repository remote.')
+# @click.option('--pr', type=int, required=False, callback=validate_pr_number, help='Pull request number.')
+
+
+@main.command()
+@click.option('--dir', 'directory', type=str, required=True, callback=validate_directory, help='Local git repository directory.')
+@click.option('--base', type=str, required=True, help='Base branch of the pull request.')
+@click.option('--head', type=str, required=False, default="HEAD", help='Head branch of the pull request. Defaults to HEAD.')
+def blame(directory: str, base: str, head: str):
+    """Run git blame on each file modified by the PR.
+
+
+    """
+    dir_path: Path = Path(directory)
+    files: list[str] = _diff_local(dir_path, base, head)
+
+    if not files or (len(files) == 1 and not files[0].strip()):
+        click.echo(yellow("No files found to analyze."))
+        return
+
+    click.echo(f"\nAnalyzing {len(files)} files for author information...\n")
+
+    emails: set[str] = set()
+
+    for file in files:
+        if not file.strip():  # Skip empty filenames
+            continue
+
+        cmd = ["git", "-C", str(dir_path), "blame", "--porcelain", "--", file]
+        click.echo(f"Getting authors for: {file}")
+
+        try:
+            result: str = run(cmd)
+
+            # Parse porcelain output to extract emails and convert to GitHub usernames
+
+            lines: list[str] = result.split('\n')
+            for line in lines:
+                if line.startswith('author-mail '):
+                    email: str = line[12:].strip('<>')  # Remove 'author-mail ' prefix and angle brackets
+                    emails.add(email)
+
+
+        except Exception as e:
+            click.echo(red(f"  Error running git blame on {file}: {e}"))
+
+    click.echo(f"\n{green('Summary:')}")
+    click.echo(f"Total unique blame emails across all files: {len(emails)}")
+
+    for email in sorted(emails):
+        click.echo(f"  {email}")

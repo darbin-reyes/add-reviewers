@@ -27,3 +27,17 @@ gh pr list --state merged --limit 100 --json number,files,reviews | jq --arg fil
 # list users who approved PR 9
 
 gh pr view 9 --json reviews | jq '.reviews[] | select(.state == \"APPROVED\") | .author.login '
+
+# 12/2/2025
+
+- Problem: Given an open pull request and the list of modified files, using graphql github API we can iterate over all merged pull requests that modified the same files.
+    - (Optionally: Open pull requests as well, but excluding this pull request).
+    - Given this list of merged pull requests, we can output the github username and email of the approvers.
+    - Finally, we use the github API to add those usernames as reviewers.
+    - Why this doesn't work: the API is too slow (hours, possibly more than 24hrs) to be run in real time either as a directly run script, as git hook, or github workflow.
+    - Failed solution: give up on using the merged github API pull requests as a data source, use git blame instead, its a single git command per modified file that is fast and does not involve network requests.
+    - Problem: git blame provides emails but  does not provide github username information and adding reviewers is only supported by username.
+    - New solution: Download the pull request information upfront and save it as a JSON file. This needs to be implemented, if supported, in a way that can resume download progress if the API connection fails because these failures are very frequent with large data transfers. Once that is downloaded, we can map blame emails to usernames and use both blame and past pull request approvers as reviewers to an open pull request.
+
+
+        - Concern: implementing this as a git hook might require that users carry this data base as a very large file. In this case a GitHub workflow may be preferable.
