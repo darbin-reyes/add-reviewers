@@ -1,13 +1,35 @@
 """CLI implementation for add-reviewers."""
 
-import subprocess
 import click
+import os
+from pathlib import Path
 from yaspin import yaspin
 from yaspin.spinners import Spinners
-from add_reviewers.x import fire, red, yellow, green
+from add_reviewers.x import (
+    fire, red, yellow, green, gh_installed, jq_installed, run, random_verb,
+    validate_pr_number, parse_repo_url, query_github_graphql
+)
 from add_reviewers._version import __version__
 
 
+def validate_directory(ctx, param, value):
+    """Validate that the directory exists and is a git repository."""
+    if value is None:
+        return value
+
+    dir_path = Path(value)
+
+    if not dir_path.exists():
+        raise click.BadParameter(f"Directory '{value}' does not exist.")
+
+    if not dir_path.is_dir():
+        raise click.BadParameter(f"'{value}' is not a directory.")
+
+    git_dir = dir_path / '.git'
+    if not git_dir.exists():
+        raise click.BadParameter(f"Directory '{value}' is not a git repository (no .git directory found).")
+
+    return value
 
 # accept -h and --help as help options, not just --help.
 CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"])
@@ -18,34 +40,253 @@ def main():
     """CLI that automatically adds pull request reviewers based on past approvals."""
     pass
 
+def _email_to_github_username(email: str) -> str | None:
+    """Try to map an email address to a GitHub username using the GitHub API."""
+    try:
+        # Use GitHub API to search for users by email
+        # Note: This requires appropriate API scopes and may not work for all emails
+        import subprocess
+        import json
 
-@main.command()
-@click.option('--remote', type=str, help='URL of repository remote. Inferred from CWD if not specified.')
-@click.option('--pr', type=int, required=True, help='Pull request number.')
-@yaspin(Spinners.dots2, text="Fooing ")
-def diff(remote, pr):
-    """List files modified by a given pull request."""
+        # Try to search for the user by email using gh api
+        cmd = ["gh", "api", "/search/users", "-f", f"q={email}"]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        data = json.loads(result.stdout)
+
+        if data.get('total_count', 0) > 0:
+            return data['items'][0]['login']
+
+        return None
+    except Exception:
+        return None
+
+def _diff_local(dir: Path, base: str, head: str):
+    """git diff locally vs. gh command/api."""
+    cmd = ["git", "-C", dir, "diff", "--name-only", f"{base}..{head}"]
+
+    stdout: str = run(cmd)
+
+    click.echo(stdout)
+
+    files: list[str] = stdout.strip().split("\n")
+
+    click.echo(f"{len(files)} files touched.")
+
+    return files
+
+def _diff(remote: str, pr: int) -> list[str]:
+    """See diff()."""
+
+    gh_installed()
 
     # Build the gh pr diff command
-    cmd = ["gh", "pr", "diff", str(pr), "--name-only"]
-
-    if remote:
-        cmd.extend(["--repo", remote])
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        m = green("\n" + result.stdout)
-        click.echo(m)
-    except subprocess.CalledProcessError as e:
-        m = red(f"Error running gh command: {e.stderr}")
-        raise click.ClickException(m) from e
-    except FileNotFoundError as e:
-        m = red("Error: 'gh' command not found. Please install GitHub CLI.")
-        raise click.ClickException(m) from e
-    except Exception as e:
-        m = red(f"Exception: {e}.")
-        raise click.ClickException(m) from e
+    cmd: list[str] = ["gh", "pr", "diff", str(pr), "--name-only", "--repo", remote]
 
 
-if __name__ == "__main__":
-    main()
+    stdout: str = run(cmd)
+
+    pr_url = f"{remote}/pull/{pr}"
+    m = green(f"\n\nFILES MODIFIED BY PR: {pr_url}")
+    click.echo(m)
+    click.echo(stdout)
+
+    files: list[str] = stdout.strip().split("\n")
+
+    click.echo(f"{len(files)} files touched.")
+
+    return files
+
+
+
+@main.command()
+@click.option('--remote', type=str, required=True, help='URL of repository remote.')
+@click.option('--pr', type=int, required=True, callback=validate_pr_number, help='Pull request number.')
+def diff(remote: str, pr: int):
+    """List files modified by a given pull request."""
+
+    with yaspin(Spinners.dots2, text=random_verb()) as spinner:
+        _diff(remote, pr)
+        spinner.ok("✓")
+
+def __list(remote: str, count: int) -> list[dict[str, str]]:
+    """See _list()."""
+    if count <= 0:
+        raise click.ClickException(red(f"{count} is invalid. Count must be positive."))
+
+    owner, repo = parse_repo_url(remote)
+
+    # GraphQL query to fetch merged PRs with files and reviews using pagination
+    # direction: DESC sorts the pull requests in descending order (newest first) based on the UPDATED_AT field.
+    # The 100 in files(first: 100) and reviews(first: 100) limits how many files and reviews are fetched for each pull request.
+    query = """
+    query($owner: String!, $repo: String!, $limit: Int!, $after: String) {
+        repository(owner: $owner, name: $repo) {
+        pullRequests(first: $limit, states: MERGED, orderBy: {field: UPDATED_AT, direction: DESC}, after: $after) {
+            pageInfo {
+            hasNextPage
+            endCursor
+            }
+            nodes {
+            number
+            files(first: 100) {
+                nodes {
+                path
+                }
+            }
+            reviews(first: 100, states: APPROVED) {
+                nodes {
+                author {
+                    login
+                }
+                }
+            }
+            }
+        }
+        }
+    }
+    """
+
+    # Fetch up to 100 PRs using pagination
+    all_pull_requests = []
+    cursor = None
+    target_count = (count // 100 + 1) * 100
+    np = target_count // 100
+
+    for page in range(np):
+        remaining = target_count - len(all_pull_requests)
+        if remaining <= 0:
+            break
+
+        page_size = min(100, remaining)
+
+        variables = {
+            'owner': owner,
+            'repo': repo,
+            'limit': page_size,
+            'after': cursor
+        }
+
+        data = query_github_graphql(query, variables)
+
+        pr_data = data.get('data', {}).get('repository', {}).get('pullRequests', {})
+        page_prs = pr_data.get('nodes', [])
+        page_info = pr_data.get('pageInfo', {})
+
+        all_pull_requests.extend(page_prs)
+
+        # Check if there are more pages and update cursor
+        if not page_info.get('hasNextPage', False):
+            break
+        cursor = page_info.get('endCursor')
+
+    # Extract and display PRs
+    pull_requests = all_pull_requests
+
+    if not pull_requests:
+        click.echo(yellow("No merged pull requests found."))
+        return []
+
+    click.echo(green(f"\n{len(pull_requests)} most recent merged pull requests in {remote}:\n"))
+
+    ret = []
+    for pr in pull_requests:
+        number = pr['number']
+        files = [f['path'] for f in pr.get('files', {}).get('nodes', [])]
+        reviews = [r['author']['login'] for r in pr.get('reviews', {}).get('nodes', []) if r.get('author')]
+
+        click.echo(f"PR #{number}")
+        click.echo(f"  Files ({len(files)}): {', '.join(files) if files else 'None'}")
+        click.echo(f"  Approved by ({len(reviews)}): {', '.join(reviews) if reviews else 'None'}")
+        click.echo()
+        ret.append({"number": number, "files" : files, "approvers": reviews})
+
+    return ret
+
+@main.command("list-merged")
+@click.option('--remote', type=str, required=True, help='URL of repository remote.')
+@click.option('--count', type=int, default=100, help='Number of pull requests to list.')
+def _list(remote: str, count: int):
+    """List the most recent merged pull requests in repository specified by remote."""
+
+    with yaspin(Spinners.dots2, text=random_verb()) as spinner:
+        __list(remote, count)
+        spinner.ok("✓")
+
+@main.command()
+@click.option('--remote', type=str, required=True, help='URL of repository remote.')
+@click.option('--pr', type=int, required=True, callback=validate_pr_number, help='Open pull request number.')
+@click.option('--count', type=int, required=True, help='Number of pull requests to list.')
+def mrm_approvers(remote: str, pr: int, count: int):
+    """
+    Lists past approvers of changes to files touched by 'pr' in the 'count' most
+    recent merged prs.
+    """
+    with yaspin(Spinners.dots2, text=random_verb()) as spinner:
+        open_pr_files: list[str] = _diff(remote, pr)
+        spinner.ok("✓")
+
+    with yaspin(Spinners.dots2, text=random_verb()) as spinner:
+        merged_prs = __list(remote, count)
+        spinner.ok("✓")
+
+    auto_reviewers = set()
+    for mpr in merged_prs:
+        # Add approvers if merged PR touched any file that the open PR touches
+        if any(f in mpr["files"] for f in open_pr_files):
+            auto_reviewers.update(mpr["approvers"])
+
+    click.echo(f"{len(auto_reviewers)} approvers found. They will be added as reviewers to PR # {pr}.")
+    click.echo(green(f"{auto_reviewers}"))
+
+
+# @click.option('--remote', type=str, required=False, help='URL of repository remote.')
+# @click.option('--pr', type=int, required=False, callback=validate_pr_number, help='Pull request number.')
+
+
+@main.command()
+@click.option('--dir', 'directory', type=str, required=True, callback=validate_directory, help='Local git repository directory.')
+@click.option('--base', type=str, required=True, help='Base branch of the pull request.')
+@click.option('--head', type=str, required=False, default="HEAD", help='Head branch of the pull request. Defaults to HEAD.')
+def blame(directory: str, base: str, head: str):
+    """Run git blame on each file modified by the PR.
+
+
+    """
+    dir_path: Path = Path(directory)
+    files: list[str] = _diff_local(dir_path, base, head)
+
+    if not files or (len(files) == 1 and not files[0].strip()):
+        click.echo(yellow("No files found to analyze."))
+        return
+
+    click.echo(f"\nAnalyzing {len(files)} files for author information...\n")
+
+    emails: set[str] = set()
+
+    for file in files:
+        if not file.strip():  # Skip empty filenames
+            continue
+
+        cmd = ["git", "-C", str(dir_path), "blame", "--porcelain", "--", file]
+        click.echo(f"Getting authors for: {file}")
+
+        try:
+            result: str = run(cmd)
+
+            # Parse porcelain output to extract emails and convert to GitHub usernames
+
+            lines: list[str] = result.split('\n')
+            for line in lines:
+                if line.startswith('author-mail '):
+                    email: str = line[12:].strip('<>')  # Remove 'author-mail ' prefix and angle brackets
+                    emails.add(email)
+
+
+        except Exception as e:
+            click.echo(red(f"  Error running git blame on {file}: {e}"))
+
+    click.echo(f"\n{green('Summary:')}")
+    click.echo(f"Total unique blame emails across all files: {len(emails)}")
+
+    for email in sorted(emails):
+        click.echo(f"  {email}")

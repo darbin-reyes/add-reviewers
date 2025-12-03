@@ -18,6 +18,7 @@ dependencies = [
     "yaspin",
     "colorama",
     "emoji",
+    "requests",
 ]
 
 [project.optional-dependencies]
